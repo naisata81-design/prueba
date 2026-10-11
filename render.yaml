@@ -1,0 +1,39 @@
+# ============================================================
+#  render.yaml — "Blueprint" opcional para Render.com
+#  Debe estar en la RAÍZ del repositorio (aquí). En Render:
+#  New + → Blueprint → elige tu repo.
+#  Si prefieres crear el servicio a mano: New + → Web Service,
+#  Root Directory = backend, Build = npm install, Start = npm start.
+# ============================================================
+services:
+  - type: web
+    name: ac-control-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Render genera valores aleatorios; los ves en Environment.
+      # ADMIN_TOKEN es la contraseña que escribirás en la página web.
+      # DEVICE_KEY es la clave que irá dentro del firmware del ESP-01.
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: DEVICE_KEY
+        generateValue: true
+      - key: APP_TIMEZONE
+        value: America/Mexico_City
+      - key: POLL_SECONDS
+        value: "10"
+      # Origen de tu página en GitHub Pages, sin "/" final y sin la ruta del repo.
+      # Ejemplo: https://tu-usuario.github.io
+      - key: ALLOWED_ORIGIN
+        sync: false
+      # Opcional pero recomendado (datos permanentes). Ver backend/storage.js
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
