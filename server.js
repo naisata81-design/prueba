@@ -79,10 +79,10 @@ const dirty = new Set();
 let flushTimer = null;
 
 const newDevice = (id, state) => ({ id, accountId: null, name: id, model: '', branchId: null, zoneId: null, desiredState: state, reportedState: state,
-  lastSeen: null, rssi: null, fw: null, ssid: null, wifiStatus: null, pendingWifi: null });
+  lastSeen: null, rssi: null, fw: null, hwModel: null, serial: null, cmdAt: null, ssid: null, wifiStatus: null, pendingWifi: null });
 const isOnline = (d) => Boolean(d.lastSeen) && Date.now() - Date.parse(d.lastSeen) < Math.max(30, POLL_SECONDS * 3) * 1000;
 const toPublic = (d) => ({ id: d.id, name: d.name, model: d.model, branchId: d.branchId, zoneId: d.zoneId, desiredState: d.desiredState, reportedState: d.reportedState,
-  online: isOnline(d), lastSeen: d.lastSeen, rssi: d.rssi, fw: d.fw, ssid: d.ssid, wifiStatus: d.wifiStatus });
+  online: isOnline(d), lastSeen: d.lastSeen, rssi: d.rssi, fw: d.fw, hwModel: d.hwModel, serial: d.serial, ssid: d.ssid, wifiStatus: d.wifiStatus });
 
 function persist(d) { dirty.add(d.id); clearTimeout(flushTimer); flushTimer = setTimeout(flush, 300); }
 async function flush() {
@@ -118,6 +118,28 @@ function cleanRoutine(b, branch) {
   return { branchId: branch._id, zoneId, onTime, offTime, days: days.sort((x, y) => x - y), enabled: b.enabled !== false };
 }
 const pubRoutine = ({ _id, accountId, ...r }) => ({ id: _id, ...r });
+
+/* Horarios que se mandan al ESP para que los guarde en su flash (formato "enc,apa,dias;..."; minutos desde 00:00, dias = máscara bit0=domingo). */
+const routineCache = new Map();
+async function routinesOf(accountId) {
+  const c = routineCache.get(accountId);
+  if (c && Date.now() - c.at < 15000) return c.list;
+  const list = await col('routines').find({ accountId, enabled: true }).toArray();
+  routineCache.set(accountId, { at: Date.now(), list });
+  return list;
+}
+const bustRoutines = (accountId) => routineCache.delete(accountId);
+const toMin = (hhmm) => { if (!hhmm) return -1; const [h, m] = String(hhmm).split(':').map(Number); return h * 60 + m; };
+async function schedFor(d) {
+  if (!d.accountId || !d.branchId) return '';
+  const list = (await routinesOf(d.accountId)).filter((r) => r.branchId === d.branchId && (!r.zoneId || r.zoneId === d.zoneId));
+  return list.slice(0, 12).map((r) => `${toMin(r.onTime)},${toMin(r.offTime)},${r.days.reduce((m, x) => m | (1 << x), 0)}`).join(';');
+}
+function localClock(date = new Date()) { // día de la semana y segundos desde las 00:00 en APP_TIMEZONE
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: APP_TIMEZONE, weekday: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(date);
+  const g = (t) => parts.find((p) => p.type === t).value;
+  return { day: WEEKDAYS[g('weekday')], secs: Number(g('hour')) * 3600 + Number(g('minute')) * 60 + Number(g('second')) };
+}
 const pubBranch = (b) => ({ id: b._id, name: b.name, type: b.type, zones: b.zones });
 async function myBranch(req, id) { const b = await col('branches').findOne({ _id: String(id || ''), accountId: req.acc._id }); if (!b) throw new HttpError(404, 'Sucursal no encontrada'); return b; }
 
@@ -205,6 +227,7 @@ app.delete('/api/branches/:id', requireUser, wrap(async (req, res) => {
   const br = await myBranch(req, req.params.id);
   for (const d of devices.values()) if (d.accountId === req.acc._id && d.branchId === br._id) release(d);
   await col('routines').deleteMany({ accountId: req.acc._id, branchId: br._id });
+  bustRoutines(req.acc._id);
   await col('branches').deleteOne({ _id: br._id });
   res.json({ ok: true });
 }));
@@ -221,6 +244,7 @@ app.delete('/api/branches/:id/zones/:zid', requireUser, wrap(async (req, res) =>
   const zones = br.zones.filter((z) => z.id !== req.params.zid);
   await col('branches').updateOne({ _id: br._id }, { $set: { zones } });
   await col('routines').deleteMany({ accountId: req.acc._id, branchId: br._id, zoneId: req.params.zid });
+  bustRoutines(req.acc._id);
   for (const d of devices.values()) if (d.accountId === req.acc._id && d.zoneId === req.params.zid) { d.zoneId = null; persist(d); }
   res.json(pubBranch({ ...br, zones }));
 }));
@@ -254,7 +278,7 @@ app.patch('/api/devices/:id', requireUser, wrap(async (req, res) => {
   res.json(toPublic(d));
 }));
 app.delete('/api/devices/:id', requireUser, (req, res) => { release(mine(req)); res.json({ ok: true }); });
-app.post('/api/devices/:id/command', requireUser, (req, res) => { const d = mine(req); d.desiredState = parseState((req.body || {}).state); persist(d); res.json(toPublic(d)); });
+app.post('/api/devices/:id/command', requireUser, (req, res) => { const d = mine(req); d.desiredState = parseState((req.body || {}).state); d.cmdAt = new Date().toISOString(); persist(d); res.json(toPublic(d)); });
 app.post('/api/devices/:id/wifi', requireUser, (req, res) => {
   const d = mine(req), b = req.body || {}, ssid = typeof b.ssid === 'string' ? b.ssid : '', password = typeof b.password === 'string' ? b.password : '';
   const sb = Buffer.byteLength(ssid), pb = Buffer.byteLength(password);
@@ -281,6 +305,14 @@ app.post('/api/devices/:id/status', requireDevice, wrap(async (req, res) => {
   if (!d.lastSeen) { d.desiredState = reported; changed = true; } // primera conexión: se adopta el estado real
   d.reportedState = reported;
   d.lastSeen = new Date().toISOString();
+  // El equipo cambió de estado solo por su horario guardado mientras no había internet: se respeta, salvo que el panel haya mandado una orden más reciente.
+  if (body.local === true && d.accountId && reported !== d.desiredState) {
+    const ago = Number.isFinite(body.localAgo) ? clamp(body.localAgo, 0, 7 * 86400) : 0;
+    if (!d.cmdAt || Date.now() - ago * 1000 > Date.parse(d.cmdAt)) { d.desiredState = reported; changed = true; }
+  }
+  // Identidad del equipo: modelo y número de serie (los informa el firmware)
+  if (typeof body.model === 'string' && /^[\w.-]{1,32}$/.test(body.model) && body.model !== d.hwModel) { d.hwModel = body.model; changed = true; }
+  if (typeof body.serial === 'string' && /^[\w.-]{1,40}$/.test(body.serial) && body.serial !== d.serial) { d.serial = body.serial; changed = true; }
   if (Number.isFinite(body.rssi)) d.rssi = body.rssi;
   if (typeof body.fw === 'string') d.fw = body.fw.slice(0, 20);
   if (typeof body.ssidHex === 'string' && /^([0-9a-f]{2}){0,32}$/i.test(body.ssidHex)) {
@@ -295,6 +327,9 @@ app.post('/api/devices/:id/status', requireDevice, wrap(async (req, res) => {
     reply.wifiPassHex = Buffer.from(d.pendingWifi.password, 'utf8').toString('hex');
     if (d.wifiStatus && d.wifiStatus.state === 'pending') { d.wifiStatus = { ...d.wifiStatus, state: 'sent', at: reply.serverTime }; changed = true; }
   }
+  // Hora local + horarios de este equipo: el ESP los guarda en su flash y sigue funcionando sin internet
+  const clk = localClock();
+  reply.localDay = clk.day; reply.localSecs = clk.secs; reply.sched = await schedFor(d);
   if (changed) persist(d);
   res.json(reply);
 }));
@@ -304,6 +339,7 @@ app.post('/api/routines', requireUser, wrap(async (req, res) => {
   if ((await col('routines').countDocuments({ accountId: req.acc._id })) >= LIM.routines) throw new HttpError(400, `Máximo ${LIM.routines} rutinas`);
   const doc = { _id: rid(), accountId: req.acc._id, ...cleanRoutine(req.body || {}, await myBranch(req, (req.body || {}).branchId)) };
   await col('routines').insertOne(doc);
+  bustRoutines(req.acc._id);
   res.status(201).json(pubRoutine(doc));
 }));
 app.put('/api/routines/:id', requireUser, wrap(async (req, res) => {
@@ -311,6 +347,7 @@ app.put('/api/routines/:id', requireUser, wrap(async (req, res) => {
   if (!cur) throw new HttpError(404, 'Rutina no encontrada');
   const doc = { ...cleanRoutine(req.body || {}, await myBranch(req, (req.body || {}).branchId)) };
   await col('routines').updateOne({ _id: cur._id }, { $set: doc });
+  bustRoutines(req.acc._id);
   res.json(pubRoutine({ ...cur, ...doc }));
 }));
 app.patch('/api/routines/:id', requireUser, wrap(async (req, res) => {
@@ -318,11 +355,13 @@ app.patch('/api/routines/:id', requireUser, wrap(async (req, res) => {
   if (!cur) throw new HttpError(404, 'Rutina no encontrada');
   const enabled = (req.body || {}).enabled !== false;
   await col('routines').updateOne({ _id: cur._id }, { $set: { enabled } });
+  bustRoutines(req.acc._id);
   res.json(pubRoutine({ ...cur, enabled }));
 }));
 app.delete('/api/routines/:id', requireUser, wrap(async (req, res) => {
   const r = await col('routines').deleteOne({ _id: req.params.id, accountId: req.acc._id });
   if (!r.deletedCount) throw new HttpError(404, 'Rutina no encontrada');
+  bustRoutines(req.acc._id);
   res.json({ ok: true });
 }));
 
@@ -373,7 +412,7 @@ async function evaluateSchedules(now = localNow()) {
     const fire = (state) => {
       for (const d of devices.values()) {
         if (d.accountId !== r.accountId || d.branchId !== r.branchId || (r.zoneId && d.zoneId !== r.zoneId) || d.desiredState === state) continue;
-        d.desiredState = state; persist(d); changes.push({ id: d.id, state });
+        d.desiredState = state; d.cmdAt = new Date().toISOString(); persist(d); changes.push({ id: d.id, state });
       }
     };
     if (r.onTime === now.hhmm && r.days.includes(now.day)) fire('ON');

@@ -34,3 +34,9 @@ Sin cambios: `POST /api/devices/:id/status` con `x-device-key`, misma respuesta 
 - Se quitó `storage.js` (Upstash/archivo): ahora todo vive en MongoDB.
 - Ya no existen las rutas viejas del panel con `ADMIN_TOKEN` (`GET /api/devices`, `/schedule`): el panel nuevo usa `/api/state` y `/api/routines`.
 - Las rutinas se evalúan en el servidor cada minuto, por sucursal o zona, con una sola zona horaria (`APP_TIMEZONE`).
+
+## Firmware DAL-RELAY-V5 (horarios en el equipo)
+En cada respuesta de `POST /api/devices/:id/status` el servidor agrega `localDay`, `localSecs` (hora local de `APP_TIMEZONE`) y `sched`
+(`"enc,apa,dias;..."`, minutos desde 00:00, `dias` = máscara bit0=domingo; máx. 12). El ESP los guarda en su flash y los ejecuta sin internet.
+Si el ESP cambió el aire por su horario estando desconectado, avisa con `local:true` + `localAgo` y el servidor respeta ese estado
+salvo que el panel haya mandado una orden más reciente. El ESP también informa `model`, `serial` y `fw` (se ven en el panel, sección Dispositivos).
