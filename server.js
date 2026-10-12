@@ -1,495 +1,402 @@
 'use strict';
-
 /**
- * ============================================================
- *  CONTROL DE AIRES — BACKEND (Node.js + Express)
- * ============================================================
- *  Pensado para desplegarse gratis en Render.com.
+ * CONTROL DE AIRES — API v2 (multi-cliente, MongoDB Atlas)
+ * Variables de entorno: MONGODB_URI, JWT_SECRET, ADMIN_TOKEN, DEVICE_KEY, ALLOWED_ORIGIN, APP_TIMEZONE, POLL_SECONDS.
  *
- *  Quién habla con quién:
- *    - El ESP-01 llama a   POST /api/devices/:id/status   (clave DEVICE_KEY)
- *    - La página web llama a  GET /api/devices, .../command, .../schedule ...
- *      (token ADMIN_TOKEN en la cabecera Authorization: Bearer ...)
- *
- *  ┌──────────────────────────────────────────────────────────┐
- *  │  DÓNDE CONFIGURAR LAS CREDENCIALES                       │
- *  │  Nada se escribe en el código: son VARIABLES DE ENTORNO  │
- *  │  (Render → tu servicio → Environment):                   │
- *  │    ADMIN_TOKEN     contraseña de la página web           │
- *  │    DEVICE_KEY      clave que usan los ESP-01             │
- *  │    ALLOWED_ORIGIN  https://TU-USUARIO.github.io          │
- *  │    APP_TIMEZONE    zona horaria de las rutinas           │
- *  │    POLL_SECONDS    cada cuánto consulta el ESP-01        │
- *  │    UPSTASH_REDIS_REST_URL / _TOKEN   (opcional, ver      │
- *  │                    storage.js: guarda datos permanentes) │
- *  └──────────────────────────────────────────────────────────┘
- *
- *  Estados: "ON" = aire encendido, "OFF" = aire apagado.
- *  Días de la semana: 0 = domingo, 1 = lunes ... 6 = sábado.
+ * El contrato con el ESP-01 NO cambió: POST /api/devices/:id/status con x-device-key, misma respuesta.
+ * Propiedad de equipos: el ID del dispositivo grabado en el ESP debe empezar con el ID de la cuenta
+ * (ej. CLI-0001AB-oficina1). Así cada cliente solo puede dar de alta sus propios equipos.
+ * Estados: "ON"/"OFF". Días: 0 = domingo ... 6 = sábado.
  */
-
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const crypto = require('crypto');
-const storage = require('./storage');
+const mongo = require('./db');
 
-/* ------------------------------------------------------------
- *  CONFIGURACIÓN (variables de entorno)
- * ---------------------------------------------------------- */
-function clamp(n, min, max) {
-  return Math.min(max, Math.max(min, n));
-}
-
+const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
 const PORT = Number(process.env.PORT) || 3000;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'cambia-este-token';
-const DEVICE_KEY = process.env.DEVICE_KEY || 'cambia-esta-clave';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const DEVICE_KEY = process.env.DEVICE_KEY || '';
+const JWT_SECRET = process.env.JWT_SECRET || '';
 const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Mexico_City';
 const POLL_SECONDS = clamp(Number(process.env.POLL_SECONDS) || 10, 3, 120);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-const MAX_ROUTINES = 20;
-
+const TOKEN_DAYS = 7;
+const LIM = { branches: 50, zones: 100, devices: 200, routines: 100 };
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/i;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TYPES = ['Edificio', 'Parque', 'Casa', 'Otro'];
 
-/* ------------------------------------------------------------
- *  MODELO EN MEMORIA
- *  Device = {
- *    id, name,
- *    desiredState: 'ON'|'OFF'   lo que se le ordena al equipo
- *    reportedState: 'ON'|'OFF'  lo que el equipo dijo tener
- *    lastSeen: ISO|null, rssi, fw,
- *    routines: [{ id, onTime:'HH:MM'|null, offTime:'HH:MM'|null,
- *                 days:[0..6], enabled:boolean }]
- *  }
- * ---------------------------------------------------------- */
+class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const col = (n) => mongo.col(n);
+const rid = () => crypto.randomBytes(5).toString('hex');
+const safeEqual = (a, b) => { const A = Buffer.from(String(a)); const B = Buffer.from(String(b)); return A.length === B.length && crypto.timingSafeEqual(A, B); };
+const text = (v, max, label) => { const s = String(v ?? '').trim(); if (!s || s.length > max) throw new HttpError(400, `${label} debe tener entre 1 y ${max} caracteres`); return s; };
+const parseState = (v) => { const s = String(v || '').toUpperCase(); if (s !== 'ON' && s !== 'OFF') throw new HttpError(400, 'El estado debe ser "ON" u "OFF"'); return s; };
+
+/* ---------- Sesiones y contraseñas (sin dependencias extra) ---------- */
+function sign(sub) {
+  const p = Buffer.from(JSON.stringify({ sub, exp: Date.now() + TOKEN_DAYS * 864e5 })).toString('base64url');
+  return `${p}.${crypto.createHmac('sha256', JWT_SECRET).update(p).digest('base64url')}`;
+}
+function verify(token) {
+  const [p, s] = String(token).split('.');
+  if (!p || !s || !safeEqual(s, crypto.createHmac('sha256', JWT_SECRET).update(p).digest('base64url'))) return null;
+  try { const o = JSON.parse(Buffer.from(p, 'base64url')); return o.exp > Date.now() ? o.sub : null; } catch { return null; }
+}
+const hashPw = (pw) => new Promise((ok, no) => { const salt = crypto.randomBytes(16); crypto.scrypt(pw, salt, 64, (e, k) => (e ? no(e) : ok(`${salt.toString('hex')}:${k.toString('hex')}`))); });
+const checkPw = (pw, stored) => new Promise((ok) => { const [s, h] = String(stored).split(':'); if (!s || !h) return ok(false); crypto.scrypt(pw, Buffer.from(s, 'hex'), 64, (e, k) => ok(!e && safeEqual(k.toString('hex'), h))); });
+
+const attempts = new Map(); // límite simple contra adivinar contraseñas
+function tooMany(key) { const a = attempts.get(key); return Boolean(a && a.reset > Date.now() && a.n >= 10); }
+function failed(key) { const a = attempts.get(key); if (a && a.reset > Date.now()) a.n += 1; else attempts.set(key, { n: 1, reset: Date.now() + 15 * 60e3 }); }
+
+const requireUser = wrap(async (req, res, next) => {
+  const h = req.get('authorization') || '';
+  const sub = h.startsWith('Bearer ') ? verify(h.slice(7)) : null;
+  const acc = sub && (await col('accounts').findOne({ _id: sub }));
+  if (!acc) return res.status(401).json({ error: 'Sesión no válida. Inicia sesión de nuevo.' });
+  req.acc = acc;
+  next();
+});
+const requireAdmin = (req, res, next) => {
+  const h = req.get('authorization') || '';
+  if (!ADMIN_TOKEN || !safeEqual(h.startsWith('Bearer ') ? h.slice(7) : '', ADMIN_TOKEN)) return res.status(401).json({ error: 'Token de administrador incorrecto' });
+  next();
+};
+const requireDevice = (req, res, next) => {
+  if (!DEVICE_KEY || !safeEqual(req.get('x-device-key') || '', DEVICE_KEY)) return res.status(401).json({ error: 'Clave de dispositivo incorrecta' });
+  next();
+};
+const pubAccount = (a) => ({ id: a._id, email: a.email, company: a.company, color: a.color, logo: a.logo });
+
+/* ---------- Dispositivos: en memoria (ruta rápida del ESP) + guardado en MongoDB ---------- */
 const devices = new Map();
+const dirty = new Set();
+let flushTimer = null;
 
-function newDevice(id, state) {
-  return {
-    id,
-    name: id,
-    desiredState: state, // al registrarse, se adopta el estado real del equipo
-    reportedState: state,
-    lastSeen: null,
-    rssi: null,
-    fw: null,
-    ssid: null, // red Wi-Fi a la que está conectado el equipo
-    wifiStatus: null, // { state, ssid, at } del último cambio de red pedido
-    pendingWifi: null, // { ssid, password } SOLO en memoria, hasta que el equipo lo recoge
-    routines: [],
-  };
+const newDevice = (id, state) => ({ id, accountId: null, name: id, model: '', branchId: null, zoneId: null, desiredState: state, reportedState: state,
+  lastSeen: null, rssi: null, fw: null, ssid: null, wifiStatus: null, pendingWifi: null });
+const isOnline = (d) => Boolean(d.lastSeen) && Date.now() - Date.parse(d.lastSeen) < Math.max(30, POLL_SECONDS * 3) * 1000;
+const toPublic = (d) => ({ id: d.id, name: d.name, model: d.model, branchId: d.branchId, zoneId: d.zoneId, desiredState: d.desiredState, reportedState: d.reportedState,
+  online: isOnline(d), lastSeen: d.lastSeen, rssi: d.rssi, fw: d.fw, ssid: d.ssid, wifiStatus: d.wifiStatus });
+
+function persist(d) { dirty.add(d.id); clearTimeout(flushTimer); flushTimer = setTimeout(flush, 300); }
+async function flush() {
+  const ids = [...dirty]; dirty.clear();
+  if (!ids.length) return;
+  const ops = ids.filter((id) => devices.has(id)).map((id) => { const { pendingWifi, ...doc } = devices.get(id); return { replaceOne: { filter: { _id: id }, replacement: doc, upsert: true } }; });
+  try { if (ops.length) await col('devices').bulkWrite(ops); } catch (err) { console.error('[mongo] Error al guardar equipos:', err.message); ids.forEach((i) => dirty.add(i)); }
+}
+function release(d) { // el equipo deja la cuenta pero sigue existiendo (si el ESP está encendido, reaparece sin dueño)
+  Object.assign(d, { accountId: null, branchId: null, zoneId: null, model: '', name: d.id, desiredState: d.reportedState, pendingWifi: null });
+  persist(d);
+}
+const ownerOf = (id, accounts) => accounts.find((a) => id.toUpperCase().startsWith(`${a._id.toUpperCase()}-`));
+const mine = (req) => { const d = devices.get(req.params.id); if (!d || d.accountId !== req.acc._id) throw new HttpError(404, 'No existe un equipo con ese ID en tu cuenta'); return d; };
+
+/* ---------- Wi-Fi (igual que antes) ---------- */
+const wifiBusy = (d) => Boolean(d.wifiStatus) && (d.wifiStatus.state === 'pending' || d.wifiStatus.state === 'sent');
+function applyWifiResult(d, r) {
+  if ((r !== 'ok' && r !== 'failed') || !wifiBusy(d)) return false;
+  d.wifiStatus = { ...d.wifiStatus, state: r, at: new Date().toISOString() }; d.pendingWifi = null; return true;
 }
 
-function isOnline(d) {
-  if (!d.lastSeen) return false;
-  const windowMs = Math.max(30, POLL_SECONDS * 3) * 1000;
-  return Date.now() - Date.parse(d.lastSeen) < windowMs;
+/* ---------- Validación de rutinas ---------- */
+function cleanRoutine(b, branch) {
+  const t = (v) => { if (v === null || v === undefined || v === '') return null; if (typeof v !== 'string' || !TIME_RE.test(v)) throw new HttpError(400, 'La hora debe tener formato HH:MM (24 h)'); return v; };
+  const onTime = t(b.onTime), offTime = t(b.offTime);
+  if (!onTime && !offTime) throw new HttpError(400, 'Define al menos una hora (encendido o apagado)');
+  if (onTime && onTime === offTime) throw new HttpError(400, 'La hora de encendido y apagado no pueden ser iguales');
+  const days = [...new Set((Array.isArray(b.days) ? b.days : []).map(Number))];
+  if (!days.length || days.some((n) => !Number.isInteger(n) || n < 0 || n > 6)) throw new HttpError(400, 'Elige al menos un día (0 = domingo ... 6 = sábado)');
+  const zoneId = b.zoneId || null;
+  if (zoneId && !branch.zones.some((z) => z.id === zoneId)) throw new HttpError(400, 'La zona no pertenece a esa sucursal');
+  return { branchId: branch._id, zoneId, onTime, offTime, days: days.sort((x, y) => x - y), enabled: b.enabled !== false };
 }
+const pubRoutine = ({ _id, accountId, ...r }) => ({ id: _id, ...r });
+const pubBranch = (b) => ({ id: b._id, name: b.name, type: b.type, zones: b.zones });
+async function myBranch(req, id) { const b = await col('branches').findOne({ _id: String(id || ''), accountId: req.acc._id }); if (!b) throw new HttpError(404, 'Sucursal no encontrada'); return b; }
 
-function toPublic(d) {
-  return {
-    id: d.id,
-    name: d.name,
-    desiredState: d.desiredState,
-    reportedState: d.reportedState,
-    online: isOnline(d),
-    lastSeen: d.lastSeen,
-    rssi: d.rssi,
-    fw: d.fw,
-    ssid: d.ssid,
-    wifiStatus: d.wifiStatus, // nunca incluye la contraseña
-    routines: d.routines,
-  };
-}
-
-/* ------------------------------------------------------------
- *  PERSISTENCIA (con pequeño retraso para agrupar cambios)
- * ---------------------------------------------------------- */
-let saveTimer = null;
-
-function snapshot() {
-  // La contraseña de una red pendiente vive solo en memoria: nunca se guarda en disco ni en Redis.
-  return { version: 1, devices: Array.from(devices.values(), ({ pendingWifi, ...rest }) => rest) };
-}
-
-function persist() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    storage.save(snapshot()).catch((err) => console.error('[storage] Error al guardar:', err.message));
-  }, 300);
-}
-
-/* ------------------------------------------------------------
- *  UTILIDADES HTTP
- * ---------------------------------------------------------- */
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-
-function safeEqual(a, b) {
-  const A = Buffer.from(String(a));
-  const B = Buffer.from(String(b));
-  return A.length === B.length && crypto.timingSafeEqual(A, B);
-}
-
-function requireAdmin(req, res, next) {
-  const header = req.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (!safeEqual(token, ADMIN_TOKEN)) return res.status(401).json({ error: 'Token de administrador incorrecto' });
-  next();
-}
-
-function requireDevice(req, res, next) {
-  if (!safeEqual(req.get('x-device-key') || '', DEVICE_KEY)) {
-    return res.status(401).json({ error: 'Clave de dispositivo incorrecta' });
-  }
-  next();
-}
-
-function mustGetDevice(id) {
-  const d = devices.get(id);
-  if (!d) throw new HttpError(404, 'No existe un equipo con ese ID');
-  return d;
-}
-
-/* ------------------------------------------------------------
- *  CAMBIO DE RED WI-FI
- *  wifiStatus.state: 'pending'   esperando que el equipo consulte
- *                    'sent'      el equipo la recibió y la está probando
- *                    'ok' | 'failed' | 'cancelled'
- *  La contraseña nueva (d.pendingWifi) solo vive en memoria.
- * ---------------------------------------------------------- */
-function wifiInProgress(d) {
-  return Boolean(d.wifiStatus) && (d.wifiStatus.state === 'pending' || d.wifiStatus.state === 'sent');
-}
-
-/** El equipo informa el resultado ("ok" / "failed"). Devuelve true si cambió algo. */
-function applyWifiResult(d, result) {
-  if ((result !== 'ok' && result !== 'failed') || !wifiInProgress(d)) return false;
-  d.wifiStatus = { ...d.wifiStatus, state: result, at: new Date().toISOString() };
-  d.pendingWifi = null;
-  return true;
-}
-
-function parseState(value) {
-  const s = String(value || '').toUpperCase();
-  if (s !== 'ON' && s !== 'OFF') throw new HttpError(400, 'El estado debe ser "ON" u "OFF"');
-  return s;
-}
-
-/* ------------------------------------------------------------
- *  VALIDACIÓN DE RUTINAS
- * ---------------------------------------------------------- */
-function cleanTime(value, label) {
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value !== 'string' || !TIME_RE.test(value)) {
-    throw new HttpError(400, `${label}: la hora debe tener formato HH:MM (24 h)`);
-  }
-  return value;
-}
-
-function normalizeRoutines(input) {
-  if (!Array.isArray(input)) throw new HttpError(400, '"routines" debe ser una lista');
-  if (input.length > MAX_ROUTINES) throw new HttpError(400, `Máximo ${MAX_ROUTINES} rutinas por equipo`);
-
-  return input.map((r, i) => {
-    const label = `Rutina ${i + 1}`;
-    const item = r || {};
-    const onTime = cleanTime(item.onTime, label);
-    const offTime = cleanTime(item.offTime, label);
-    if (!onTime && !offTime) throw new HttpError(400, `${label}: define al menos una hora (encendido o apagado)`);
-    if (onTime && offTime && onTime === offTime) {
-      throw new HttpError(400, `${label}: la hora de encendido y apagado no pueden ser iguales`);
-    }
-
-    const days = [...new Set((Array.isArray(item.days) ? item.days : []).map(Number))];
-    if (!days.length || days.some((n) => !Number.isInteger(n) || n < 0 || n > 6)) {
-      throw new HttpError(400, `${label}: elige al menos un día (0 = domingo ... 6 = sábado)`);
-    }
-    days.sort((a, b) => a - b);
-
-    return {
-      id: typeof item.id === 'string' && item.id.length <= 40 ? item.id : crypto.randomUUID(),
-      onTime,
-      offTime,
-      days,
-      enabled: item.enabled !== false,
-    };
-  });
-}
-
-/* ------------------------------------------------------------
- *  APP EXPRESS
- * ---------------------------------------------------------- */
+/* ---------- App ---------- */
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map((s) => s.trim()),
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+const small = express.json({ limit: '20kb' });
+const big = express.json({ limit: '400kb' }); // solo para el logo en PATCH /api/me
+app.use((req, res, next) => (req.method === 'PATCH' && req.path === '/api/me' ? big : small)(req, res, next));
 
-app.use(
-  cors({
-    origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map((s) => s.trim()),
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
-app.use(express.json({ limit: '20kb' }));
-
-// Para comprobar que el servicio vive (Render lo usa como health check).
-app.get('/', (req, res) => res.json({ ok: true, service: 'ac-control-api' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'ac-control-api', version: 2 }));
 app.get('/health', (req, res) => res.type('text').send('ok'));
 
-/** GET /api/devices — lista todos los aires con estado y rutinas. */
-app.get('/api/devices', requireAdmin, (req, res) => {
-  const list = Array.from(devices.values())
-    .map(toPublic)
-    .sort((a, b) => a.id.localeCompare(b.id));
+/* Cuentas */
+app.post('/api/auth/register', wrap(async (req, res) => {
+  const b = req.body || {};
+  const email = String(b.email || '').trim().toLowerCase(), pw = String(b.password || '');
+  if (!EMAIL_RE.test(email) || email.length > 120) throw new HttpError(400, 'Correo no válido');
+  if (pw.length < 8 || pw.length > 100) throw new HttpError(400, 'La contraseña debe tener al menos 8 caracteres');
+  if (await col('accounts').findOne({ email })) throw new HttpError(409, 'Ese correo ya tiene una cuenta');
+  const r = await col('counters').findOneAndUpdate({ _id: 'accounts' }, { $inc: { n: 1 } }, { upsert: true, returnDocument: 'after' });
+  const n = (r && r.value ? r.value : r).n;
+  const suffix = crypto.randomBytes(2).toString('hex').slice(0, 2).toUpperCase();
+  const acc = { _id: `CLI-${String(n).padStart(4, '0')}${suffix}`, email, hash: await hashPw(pw), company: String(b.company || '').trim().slice(0, 60) || 'Mi empresa', color: '#2563eb', logo: '', createdAt: new Date().toISOString() };
+  try { await col('accounts').insertOne(acc); } catch (e) { if (e.code === 11000) throw new HttpError(409, 'Ese correo ya tiene una cuenta'); throw e; }
+  res.status(201).json({ token: sign(acc._id), account: pubAccount(acc) });
+}));
+
+app.post('/api/auth/login', wrap(async (req, res) => {
+  const email = String((req.body || {}).email || '').trim().toLowerCase(), key = `${req.ip}|${email}`;
+  if (tooMany(key)) throw new HttpError(429, 'Demasiados intentos. Espera unos minutos.');
+  const acc = await col('accounts').findOne({ email });
+  if (!acc || !(await checkPw(String((req.body || {}).password || ''), acc.hash))) { failed(key); throw new HttpError(401, 'Correo o contraseña incorrectos'); }
+  attempts.delete(key);
+  res.json({ token: sign(acc._id), account: pubAccount(acc) });
+}));
+
+app.patch('/api/me', requireUser, wrap(async (req, res) => {
+  const b = req.body || {}, set = {};
+  if (b.company !== undefined) set.company = text(b.company, 60, 'El nombre de la empresa');
+  if (b.color !== undefined) { if (!/^#[0-9a-f]{6}$/i.test(b.color)) throw new HttpError(400, 'Color no válido'); set.color = b.color; }
+  if (b.logo !== undefined) { if (b.logo && !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(b.logo)) throw new HttpError(400, 'Logo no válido (PNG, JPG o WebP)'); if (String(b.logo).length > 300000) throw new HttpError(400, 'El logo es demasiado grande'); set.logo = b.logo; }
+  if (Object.keys(set).length) await col('accounts').updateOne({ _id: req.acc._id }, { $set: set });
+  res.json({ account: pubAccount({ ...req.acc, ...set }) });
+}));
+
+/* Todo el estado de la cuenta en una sola llamada (para el sondeo del panel) */
+app.get('/api/state', requireUser, wrap(async (req, res) => {
+  const id = req.acc._id;
+  const [branches, routines] = await Promise.all([col('branches').find({ accountId: id }).toArray(), col('routines').find({ accountId: id }).toArray()]);
+  const prefix = `${id.toUpperCase()}-`;
   res.json({
-    serverTime: new Date().toISOString(),
-    timezone: APP_TIMEZONE,
-    pollSeconds: POLL_SECONDS,
-    devices: list,
+    serverTime: new Date().toISOString(), timezone: APP_TIMEZONE, pollSeconds: POLL_SECONDS, account: pubAccount(req.acc),
+    branches: branches.map(pubBranch), routines: routines.map(pubRoutine),
+    devices: [...devices.values()].filter((d) => d.accountId === id).sort((a, b) => a.id.localeCompare(b.id)).map(toPublic),
+    detected: [...devices.values()].filter((d) => !d.accountId && d.id.toUpperCase().startsWith(prefix)).map((d) => ({ id: d.id, online: isOnline(d), fw: d.fw })),
   });
+}));
+
+/* Sucursales y zonas */
+app.post('/api/branches', requireUser, wrap(async (req, res) => {
+  const b = req.body || {};
+  if (!TYPES.includes(b.type)) throw new HttpError(400, `El tipo debe ser: ${TYPES.join(', ')}`);
+  if ((await col('branches').countDocuments({ accountId: req.acc._id })) >= LIM.branches) throw new HttpError(400, `Máximo ${LIM.branches} sucursales`);
+  const doc = { _id: rid(), accountId: req.acc._id, name: text(b.name, 60, 'El nombre'), type: b.type, zones: [] };
+  await col('branches').insertOne(doc);
+  res.status(201).json(pubBranch(doc));
+}));
+app.patch('/api/branches/:id', requireUser, wrap(async (req, res) => {
+  const br = await myBranch(req, req.params.id), b = req.body || {}, set = {};
+  if (b.name !== undefined) set.name = text(b.name, 60, 'El nombre');
+  if (b.type !== undefined) { if (!TYPES.includes(b.type)) throw new HttpError(400, 'Tipo no válido'); set.type = b.type; }
+  await col('branches').updateOne({ _id: br._id }, { $set: set });
+  res.json(pubBranch({ ...br, ...set }));
+}));
+app.delete('/api/branches/:id', requireUser, wrap(async (req, res) => {
+  const br = await myBranch(req, req.params.id);
+  for (const d of devices.values()) if (d.accountId === req.acc._id && d.branchId === br._id) release(d);
+  await col('routines').deleteMany({ accountId: req.acc._id, branchId: br._id });
+  await col('branches').deleteOne({ _id: br._id });
+  res.json({ ok: true });
+}));
+app.post('/api/branches/:id/zones', requireUser, wrap(async (req, res) => {
+  const br = await myBranch(req, req.params.id);
+  if (br.zones.length >= LIM.zones) throw new HttpError(400, `Máximo ${LIM.zones} zonas por sucursal`);
+  const zones = [...br.zones, { id: rid(), name: text((req.body || {}).name, 60, 'El nombre de la zona') }];
+  await col('branches').updateOne({ _id: br._id }, { $set: { zones } });
+  res.status(201).json(pubBranch({ ...br, zones }));
+}));
+app.delete('/api/branches/:id/zones/:zid', requireUser, wrap(async (req, res) => {
+  const br = await myBranch(req, req.params.id);
+  if (!br.zones.some((z) => z.id === req.params.zid)) throw new HttpError(404, 'Zona no encontrada');
+  const zones = br.zones.filter((z) => z.id !== req.params.zid);
+  await col('branches').updateOne({ _id: br._id }, { $set: { zones } });
+  await col('routines').deleteMany({ accountId: req.acc._id, branchId: br._id, zoneId: req.params.zid });
+  for (const d of devices.values()) if (d.accountId === req.acc._id && d.zoneId === req.params.zid) { d.zoneId = null; persist(d); }
+  res.json(pubBranch({ ...br, zones }));
+}));
+
+/* Dispositivos del cliente */
+async function placement(req, b) { // valida sucursal y zona de la cuenta
+  if (!b.branchId) return { branchId: null, zoneId: null };
+  const br = await myBranch(req, b.branchId);
+  if (b.zoneId && !br.zones.some((z) => z.id === b.zoneId)) throw new HttpError(400, 'La zona no pertenece a esa sucursal');
+  return { branchId: br._id, zoneId: b.zoneId || null };
+}
+app.post('/api/devices', requireUser, wrap(async (req, res) => {
+  const b = req.body || {}, id = String(b.id || '').trim();
+  if (!ID_RE.test(id)) throw new HttpError(400, 'ID inválido (letras, números, - o _; máx. 40)');
+  if (!id.toUpperCase().startsWith(`${req.acc._id.toUpperCase()}-`)) throw new HttpError(400, `El ID del dispositivo debe empezar con el ID de tu cuenta: ${req.acc._id}-`);
+  if ([...devices.values()].filter((d) => d.accountId === req.acc._id).length >= LIM.devices) throw new HttpError(400, `Máximo ${LIM.devices} dispositivos`);
+  let d = devices.get(id);
+  if (d && d.accountId) throw new HttpError(409, 'Ese ID ya está dado de alta');
+  if (!d) { d = newDevice(id, 'OFF'); devices.set(id, d); }
+  Object.assign(d, { accountId: req.acc._id, name: b.name ? text(b.name, 60, 'El nombre') : id, model: String(b.model || '').trim().slice(0, 60), ...(await placement(req, b)) });
+  if (d.lastSeen) d.desiredState = d.reportedState; // si el equipo ya había llamado, se respeta su estado real
+  persist(d);
+  res.status(201).json(toPublic(d));
+}));
+app.patch('/api/devices/:id', requireUser, wrap(async (req, res) => {
+  const d = mine(req), b = req.body || {};
+  if (b.name !== undefined) d.name = text(b.name, 60, 'El nombre');
+  if (b.model !== undefined) d.model = String(b.model).trim().slice(0, 60);
+  if (b.branchId !== undefined) Object.assign(d, await placement(req, b));
+  persist(d);
+  res.json(toPublic(d));
+}));
+app.delete('/api/devices/:id', requireUser, (req, res) => { release(mine(req)); res.json({ ok: true }); });
+app.post('/api/devices/:id/command', requireUser, (req, res) => { const d = mine(req); d.desiredState = parseState((req.body || {}).state); persist(d); res.json(toPublic(d)); });
+app.post('/api/devices/:id/wifi', requireUser, (req, res) => {
+  const d = mine(req), b = req.body || {}, ssid = typeof b.ssid === 'string' ? b.ssid : '', password = typeof b.password === 'string' ? b.password : '';
+  const sb = Buffer.byteLength(ssid), pb = Buffer.byteLength(password);
+  if (sb < 1 || sb > 32) throw new HttpError(400, 'El nombre de la red debe tener entre 1 y 32 caracteres');
+  if (pb !== 0 && (pb < 8 || pb > 63)) throw new HttpError(400, 'La contraseña debe tener entre 8 y 63 caracteres (vacía solo si la red es abierta)');
+  if (wifiBusy(d)) throw new HttpError(409, 'Ya hay un cambio de red en curso. Espera el resultado o cancélalo');
+  d.pendingWifi = { ssid, password }; d.wifiStatus = { state: 'pending', ssid, at: new Date().toISOString() };
+  persist(d); res.json(toPublic(d));
+});
+app.delete('/api/devices/:id/wifi', requireUser, (req, res) => {
+  const d = mine(req);
+  if (!wifiBusy(d)) throw new HttpError(409, 'No hay un cambio de red en curso');
+  d.pendingWifi = null; d.wifiStatus = { ...d.wifiStatus, state: 'cancelled', at: new Date().toISOString() };
+  persist(d); res.json(toPublic(d));
 });
 
-/**
- * POST /api/devices/:id/status — lo llama el ESP-01.
- * Body: { "state": "ON"|"OFF", "rssi": -60, "fw": "1.0.0" }
- * Responde con el estado que debe tener el relé.
- * Si el ID no existe, el equipo se registra solo la primera vez.
- */
-app.post('/api/devices/:id/status', requireDevice, (req, res) => {
+/* ESP-01 — contrato sin cambios. Body: { state, rssi, fw, ssidHex, wifiResult } */
+app.post('/api/devices/:id/status', requireDevice, wrap(async (req, res) => {
   const id = req.params.id;
   if (!ID_RE.test(id)) throw new HttpError(400, 'ID inválido (usa letras, números, - o _; máx. 40)');
-  const body = req.body || {};
-  const reported = parseState(body.state);
-
-  let d = devices.get(id);
-  const isNew = !d;
-  if (isNew) {
-    d = newDevice(id, reported);
-    devices.set(id, d);
-    console.log(`[devices] Equipo nuevo registrado: ${id} (estado ${reported})`);
-  }
-
+  const body = req.body || {}, reported = parseState(body.state);
+  let d = devices.get(id), changed = false;
+  if (!d) { d = newDevice(id, reported); devices.set(id, d); changed = true; console.log(`[devices] Equipo nuevo detectado: ${id}`); }
+  if (!d.lastSeen) { d.desiredState = reported; changed = true; } // primera conexión: se adopta el estado real
   d.reportedState = reported;
   d.lastSeen = new Date().toISOString();
   if (Number.isFinite(body.rssi)) d.rssi = body.rssi;
   if (typeof body.fw === 'string') d.fw = body.fw.slice(0, 20);
-
-  let changed = isNew;
-
-  // Red a la que está conectado (llega en hexadecimal para evitar problemas con comillas y acentos).
   if (typeof body.ssidHex === 'string' && /^([0-9a-f]{2}){0,32}$/i.test(body.ssidHex)) {
     const ssid = Buffer.from(body.ssidHex, 'hex').toString('utf8');
-    if (ssid !== d.ssid) {
-      d.ssid = ssid;
-      changed = true;
-    }
+    if (ssid !== d.ssid) { d.ssid = ssid; changed = true; }
   }
   if (applyWifiResult(d, body.wifiResult)) changed = true;
-
-  const reply = { desired: d.desiredState, pollSeconds: POLL_SECONDS, serverTime: new Date().toISOString() };
-
-  // Si hay una red nueva pendiente, se le entrega al equipo (en hexadecimal).
-  if (d.pendingWifi) {
+  // Un equipo sin dueño nunca recibe órdenes: se queda como está.
+  const reply = { desired: d.accountId ? d.desiredState : reported, pollSeconds: POLL_SECONDS, serverTime: d.lastSeen };
+  if (d.accountId && d.pendingWifi) {
     reply.wifiSsidHex = Buffer.from(d.pendingWifi.ssid, 'utf8').toString('hex');
     reply.wifiPassHex = Buffer.from(d.pendingWifi.password, 'utf8').toString('hex');
-    if (d.wifiStatus && d.wifiStatus.state === 'pending') {
-      d.wifiStatus = { ...d.wifiStatus, state: 'sent', at: new Date().toISOString() };
-      changed = true;
-    }
+    if (d.wifiStatus && d.wifiStatus.state === 'pending') { d.wifiStatus = { ...d.wifiStatus, state: 'sent', at: reply.serverTime }; changed = true; }
   }
-
-  if (changed) persist();
+  if (changed) persist(d);
   res.json(reply);
-});
+}));
 
-/** POST /api/devices/:id/command — botón manual de la web. Body: { "state": "ON"|"OFF" } */
-app.post('/api/devices/:id/command', requireAdmin, (req, res) => {
-  const d = mustGetDevice(req.params.id);
-  d.desiredState = parseState((req.body || {}).state);
-  persist();
-  res.json(toPublic(d));
-});
-
-/**
- * POST /api/devices/:id/schedule — guarda las rutinas (reemplaza la lista completa).
- * Body: { "routines": [ { "onTime":"08:00", "offTime":"18:00", "days":[1,2,3,4,5], "enabled":true } ] }
- */
-app.post('/api/devices/:id/schedule', requireAdmin, (req, res) => {
-  const d = mustGetDevice(req.params.id);
-  d.routines = normalizeRoutines((req.body || {}).routines);
-  persist();
-  res.json(toPublic(d));
-});
-
-/** PATCH /api/devices/:id — cambia el nombre. Body: { "name": "Aire Recepción" } */
-app.patch('/api/devices/:id', requireAdmin, (req, res) => {
-  const d = mustGetDevice(req.params.id);
-  const name = String((req.body || {}).name ?? '').trim();
-  if (!name || name.length > 60) throw new HttpError(400, 'El nombre debe tener entre 1 y 60 caracteres');
-  d.name = name;
-  persist();
-  res.json(toPublic(d));
-});
-
-/**
- * POST /api/devices/:id/wifi — pide al equipo que cambie de red Wi-Fi.
- * Body: { "ssid": "MiRed", "password": "clave" }  (password vacío = red abierta)
- * El equipo prueba la red nueva; si no conecta o no llega al servidor, vuelve a la anterior.
- */
-app.post('/api/devices/:id/wifi', requireAdmin, (req, res) => {
-  const d = mustGetDevice(req.params.id);
-  const body = req.body || {};
-  const ssid = typeof body.ssid === 'string' ? body.ssid : '';
-  const password = typeof body.password === 'string' ? body.password : '';
-  const ssidBytes = Buffer.byteLength(ssid, 'utf8');
-  const passBytes = Buffer.byteLength(password, 'utf8');
-
-  if (ssidBytes < 1 || ssidBytes > 32) throw new HttpError(400, 'El nombre de la red debe tener entre 1 y 32 caracteres');
-  if (passBytes !== 0 && (passBytes < 8 || passBytes > 63)) {
-    throw new HttpError(400, 'La contraseña debe tener entre 8 y 63 caracteres (déjala vacía solo si la red es abierta)');
-  }
-  if (wifiInProgress(d)) throw new HttpError(409, 'Ya hay un cambio de red en curso. Espera el resultado o cancélalo');
-
-  d.pendingWifi = { ssid, password };
-  d.wifiStatus = { state: 'pending', ssid, at: new Date().toISOString() };
-  persist();
-  res.json(toPublic(d));
-});
-
-/** DELETE /api/devices/:id/wifi — cancela un cambio de red que el equipo aún no terminó. */
-app.delete('/api/devices/:id/wifi', requireAdmin, (req, res) => {
-  const d = mustGetDevice(req.params.id);
-  if (!wifiInProgress(d)) throw new HttpError(409, 'No hay un cambio de red en curso');
-  d.pendingWifi = null;
-  d.wifiStatus = { ...d.wifiStatus, state: 'cancelled', at: new Date().toISOString() };
-  persist();
-  res.json(toPublic(d));
-});
-
-/** DELETE /api/devices/:id — elimina un equipo (si sigue encendido, se registrará de nuevo). */
-app.delete('/api/devices/:id', requireAdmin, (req, res) => {
-  mustGetDevice(req.params.id);
-  devices.delete(req.params.id);
-  persist();
+/* Rutinas */
+app.post('/api/routines', requireUser, wrap(async (req, res) => {
+  if ((await col('routines').countDocuments({ accountId: req.acc._id })) >= LIM.routines) throw new HttpError(400, `Máximo ${LIM.routines} rutinas`);
+  const doc = { _id: rid(), accountId: req.acc._id, ...cleanRoutine(req.body || {}, await myBranch(req, (req.body || {}).branchId)) };
+  await col('routines').insertOne(doc);
+  res.status(201).json(pubRoutine(doc));
+}));
+app.put('/api/routines/:id', requireUser, wrap(async (req, res) => {
+  const cur = await col('routines').findOne({ _id: req.params.id, accountId: req.acc._id });
+  if (!cur) throw new HttpError(404, 'Rutina no encontrada');
+  const doc = { ...cleanRoutine(req.body || {}, await myBranch(req, (req.body || {}).branchId)) };
+  await col('routines').updateOne({ _id: cur._id }, { $set: doc });
+  res.json(pubRoutine({ ...cur, ...doc }));
+}));
+app.patch('/api/routines/:id', requireUser, wrap(async (req, res) => {
+  const cur = await col('routines').findOne({ _id: req.params.id, accountId: req.acc._id });
+  if (!cur) throw new HttpError(404, 'Rutina no encontrada');
+  const enabled = (req.body || {}).enabled !== false;
+  await col('routines').updateOne({ _id: cur._id }, { $set: { enabled } });
+  res.json(pubRoutine({ ...cur, enabled }));
+}));
+app.delete('/api/routines/:id', requireUser, wrap(async (req, res) => {
+  const r = await col('routines').deleteOne({ _id: req.params.id, accountId: req.acc._id });
+  if (!r.deletedCount) throw new HttpError(404, 'Rutina no encontrada');
   res.json({ ok: true });
-});
+}));
+
+/* Administración propia (ADMIN_TOKEN) */
+app.get('/api/admin/accounts', requireAdmin, wrap(async (req, res) => {
+  const [accs, brs, rts] = await Promise.all([col('accounts').find({}).toArray(), col('branches').find({}).toArray(), col('routines').find({}).toArray()]);
+  const count = (list, id) => list.filter((x) => x.accountId === id).length;
+  res.json({ accounts: accs.map((a) => ({ ...pubAccount(a), createdAt: a.createdAt, branches: count(brs, a._id), routines: count(rts, a._id),
+    devices: [...devices.values()].filter((d) => d.accountId === a._id).length })) });
+}));
+app.get('/api/admin/devices', requireAdmin, (req, res) => res.json({ devices: [...devices.values()].map((d) => ({ ...toPublic(d), accountId: d.accountId })) }));
+app.post('/api/admin/devices/:id/assign', requireAdmin, wrap(async (req, res) => { // para equipos viejos sin prefijo de cuenta
+  const d = devices.get(req.params.id), accountId = String((req.body || {}).accountId || '');
+  if (!d) throw new HttpError(404, 'Equipo no encontrado');
+  if (!(await col('accounts').findOne({ _id: accountId }))) throw new HttpError(404, 'Cuenta no encontrada');
+  Object.assign(d, { accountId, branchId: null, zoneId: null }); persist(d); res.json(toPublic(d));
+}));
+app.delete('/api/admin/accounts/:id', requireAdmin, wrap(async (req, res) => {
+  const id = req.params.id;
+  if (!(await col('accounts').findOne({ _id: id }))) throw new HttpError(404, 'Cuenta no encontrada');
+  for (const d of devices.values()) if (d.accountId === id) release(d);
+  await Promise.all([col('routines').deleteMany({ accountId: id }), col('branches').deleteMany({ accountId: id }), col('accounts').deleteOne({ _id: id })]);
+  res.json({ ok: true });
+}));
 
 app.use((req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
-
-// Manejo central de errores (validaciones, JSON mal formado, etc.)
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON inválido' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Contenido demasiado grande' });
   console.error('[error]', err);
   res.status(500).json({ error: 'Error interno del servidor' });
 });
 
-/* ------------------------------------------------------------
- *  PLANIFICADOR (node-cron)
- *  Cada minuto revisa las rutinas. Si la hora y el día coinciden,
- *  cambia el estado deseado; el ESP-01 lo aplica en su siguiente consulta.
- *  Un ON/OFF manual dura hasta que otra rutina lo cambie.
- *  Rutinas nocturnas (ej. enciende 22:00, apaga 06:00): el apagado
- *  cuenta como parte del día en que empezó la rutina.
- * ---------------------------------------------------------- */
+/* ---------- Planificador: cada minuto aplica las rutinas por sucursal/zona ---------- */
 const WEEKDAYS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-
-/** Día de la semana y hora "HH:MM" actuales en APP_TIMEZONE. */
 function localNow(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: APP_TIMEZONE,
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(date);
-  const get = (type) => parts.find((p) => p.type === type).value;
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: APP_TIMEZONE, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t).value;
   return { day: WEEKDAYS[get('weekday')], hhmm: `${get('hour')}:${get('minute')}` };
 }
-
-function evaluateSchedules(now = localNow()) {
-  const prevDay = (now.day + 6) % 7;
-  const changes = [];
-
-  for (const d of devices.values()) {
-    for (const r of d.routines) {
-      if (!r.enabled) continue;
-      const overnight = r.onTime && r.offTime && r.offTime < r.onTime;
-
-      const fire = (state) => {
-        if (d.desiredState !== state) {
-          d.desiredState = state;
-          changes.push({ id: d.id, state, routine: r.id });
-        }
-      };
-      if (r.onTime === now.hhmm && r.days.includes(now.day)) fire('ON');
-      if (r.offTime === now.hhmm && r.days.includes(overnight ? prevDay : now.day)) fire('OFF');
-    }
+async function evaluateSchedules(now = localNow()) {
+  const prevDay = (now.day + 6) % 7, changes = [];
+  const routines = await col('routines').find({ enabled: true }).toArray();
+  for (const r of routines) {
+    const overnight = r.onTime && r.offTime && r.offTime < r.onTime;
+    const fire = (state) => {
+      for (const d of devices.values()) {
+        if (d.accountId !== r.accountId || d.branchId !== r.branchId || (r.zoneId && d.zoneId !== r.zoneId) || d.desiredState === state) continue;
+        d.desiredState = state; persist(d); changes.push({ id: d.id, state });
+      }
+    };
+    if (r.onTime === now.hhmm && r.days.includes(now.day)) fire('ON');
+    if (r.offTime === now.hhmm && r.days.includes(overnight ? prevDay : now.day)) fire('OFF');
   }
-
-  if (changes.length) {
-    persist();
-    for (const c of changes) console.log(`[scheduler] ${now.hhmm} → ${c.id}: ${c.state}`);
-  }
+  for (const c of changes) console.log(`[scheduler] ${now.hhmm} → ${c.id}: ${c.state}`);
   return changes;
 }
 
-/* ------------------------------------------------------------
- *  ARRANQUE
- * ---------------------------------------------------------- */
 async function main() {
+  try { new Intl.DateTimeFormat('en-US', { timeZone: APP_TIMEZONE }); } catch { console.error(`APP_TIMEZONE inválida: "${APP_TIMEZONE}"`); process.exit(1); }
+  const missing = ['MONGODB_URI', 'JWT_SECRET', 'ADMIN_TOKEN', 'DEVICE_KEY'].filter((k) => !process.env[k]);
+  if (missing.length) { console.error(`Faltan variables de entorno: ${missing.join(', ')}`); process.exit(1); }
   try {
-    new Intl.DateTimeFormat('en-US', { timeZone: APP_TIMEZONE });
-  } catch {
-    console.error(`APP_TIMEZONE inválida: "${APP_TIMEZONE}". Ejemplo: America/Mexico_City`);
-    process.exit(1);
-  }
-
-  if (ADMIN_TOKEN === 'cambia-este-token' || DEVICE_KEY === 'cambia-esta-clave') {
-    console.warn('⚠️  Estás usando ADMIN_TOKEN / DEVICE_KEY por defecto. Defínelos como variables de entorno.');
-  }
-  if (storage.isEphemeralRisk) {
-    console.warn('⚠️  Sin Upstash Redis: en Render los datos se pierden al reiniciar. Revisa storage.js.');
-  }
-
-  try {
-    const saved = await storage.load();
-    if (saved && Array.isArray(saved.devices)) {
-      for (const d of saved.devices) {
-        const dev = { ...newDevice(d.id, 'OFF'), ...d, pendingWifi: null };
-        // La contraseña pendiente no se guarda: si el servidor se reinició a mitad de un cambio, queda cancelado.
-        if (wifiInProgress(dev)) dev.wifiStatus = { ...dev.wifiStatus, state: 'cancelled', at: new Date().toISOString() };
-        devices.set(dev.id, dev);
-      }
+    await mongo.connect();
+    for (const d of await col('devices').find({}).toArray()) {
+      const dev = { ...newDevice(d._id, 'OFF'), ...d, id: d._id, pendingWifi: null };
+      delete dev._id;
+      if (wifiBusy(dev)) dev.wifiStatus = { ...dev.wifiStatus, state: 'cancelled', at: new Date().toISOString() }; // la clave pendiente no se guarda
+      devices.set(dev.id, dev);
     }
-    console.log(`[storage] ${storage.mode}: ${devices.size} equipo(s) cargado(s)`);
-  } catch (err) {
-    // No seguimos: guardar un estado vacío encima de los datos reales sería peor.
-    console.error('[storage] No se pudo cargar el estado:', err.message);
-    process.exit(1);
-  }
+    console.log(`[mongo] conectado: ${devices.size} equipo(s) cargado(s)`);
+  } catch (err) { console.error('[mongo] No se pudo iniciar:', err.message); process.exit(1); }
 
-  cron.schedule('* * * * *', () => evaluateSchedules(), { timezone: APP_TIMEZONE });
-
+  cron.schedule('* * * * *', () => evaluateSchedules().catch((e) => console.error('[scheduler]', e.message)), { timezone: APP_TIMEZONE });
   app.listen(PORT, () => console.log(`API lista en el puerto ${PORT} (zona horaria ${APP_TIMEZONE})`));
-
-  // Render envía SIGTERM al reiniciar o redesplegar: guardamos antes de salir.
-  process.on('SIGTERM', async () => {
-    try {
-      await storage.save(snapshot());
-    } catch (err) {
-      console.error('[storage] Error al guardar al cerrar:', err.message);
-    }
-    process.exit(0);
-  });
+  process.on('SIGTERM', async () => { await flush(); await mongo.close(); process.exit(0); });
 }
 
 if (require.main === module) main();
-
-module.exports = { app, devices, evaluateSchedules, localNow, normalizeRoutines };
+module.exports = { app, devices, evaluateSchedules, localNow };

@@ -1,39 +1,30 @@
-# ============================================================
-#  render.yaml — "Blueprint" opcional para Render.com
-#  Debe estar en la RAÍZ del repositorio (aquí). En Render:
-#  New + → Blueprint → elige tu repo.
-#  Si prefieres crear el servicio a mano: New + → Web Service,
-#  Root Directory = backend, Build = npm install, Start = npm start.
-# ============================================================
+# Blueprint de Render. Debe estar en la RAÍZ del repositorio.
+# Las claves marcadas "sync: false" se escriben a mano en Render → Environment (nunca en el código).
 services:
   - type: web
     name: ac-control-api
     runtime: node
     plan: free
-    rootDir: backend
+    rootDir: .
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_VERSION
         value: "20"
-      # Render genera valores aleatorios; los ves en Environment.
-      # ADMIN_TOKEN es la contraseña que escribirás en la página web.
-      # DEVICE_KEY es la clave que irá dentro del firmware del ESP-01.
-      - key: ADMIN_TOKEN
+      - key: MONGODB_URI        # cadena de MongoDB Atlas
+        sync: false
+      - key: MONGODB_DB
+        value: ac-control
+      - key: JWT_SECRET         # firma las sesiones de los clientes
         generateValue: true
-      - key: DEVICE_KEY
+      - key: ADMIN_TOKEN        # contraseña del panel de administración propia
         generateValue: true
+      - key: DEVICE_KEY         # la MISMA que ya tienen grabada los ESP-01
+        sync: false
       - key: APP_TIMEZONE
         value: America/Mexico_City
       - key: POLL_SECONDS
         value: "10"
-      # Origen de tu página en GitHub Pages, sin "/" final y sin la ruta del repo.
-      # Ejemplo: https://tu-usuario.github.io
-      - key: ALLOWED_ORIGIN
-        sync: false
-      # Opcional pero recomendado (datos permanentes). Ver backend/storage.js
-      - key: UPSTASH_REDIS_REST_URL
-        sync: false
-      - key: UPSTASH_REDIS_REST_TOKEN
+      - key: ALLOWED_ORIGIN     # https://tu-usuario.github.io (varios: separados por coma)
         sync: false
