@@ -74,6 +74,9 @@ function newDevice(id, state) {
     lastSeen: null,
     rssi: null,
     fw: null,
+    ssid: null, // red Wi-Fi a la que está conectado el equipo
+    wifiStatus: null, // { state, ssid, at } del último cambio de red pedido
+    pendingWifi: null, // { ssid, password } SOLO en memoria, hasta que el equipo lo recoge
     routines: [],
   };
 }
@@ -94,6 +97,8 @@ function toPublic(d) {
     lastSeen: d.lastSeen,
     rssi: d.rssi,
     fw: d.fw,
+    ssid: d.ssid,
+    wifiStatus: d.wifiStatus, // nunca incluye la contraseña
     routines: d.routines,
   };
 }
@@ -104,7 +109,8 @@ function toPublic(d) {
 let saveTimer = null;
 
 function snapshot() {
-  return { version: 1, devices: Array.from(devices.values()) };
+  // La contraseña de una red pendiente vive solo en memoria: nunca se guarda en disco ni en Redis.
+  return { version: 1, devices: Array.from(devices.values(), ({ pendingWifi, ...rest }) => rest) };
 }
 
 function persist() {
@@ -148,6 +154,25 @@ function mustGetDevice(id) {
   const d = devices.get(id);
   if (!d) throw new HttpError(404, 'No existe un equipo con ese ID');
   return d;
+}
+
+/* ------------------------------------------------------------
+ *  CAMBIO DE RED WI-FI
+ *  wifiStatus.state: 'pending'   esperando que el equipo consulte
+ *                    'sent'      el equipo la recibió y la está probando
+ *                    'ok' | 'failed' | 'cancelled'
+ *  La contraseña nueva (d.pendingWifi) solo vive en memoria.
+ * ---------------------------------------------------------- */
+function wifiInProgress(d) {
+  return Boolean(d.wifiStatus) && (d.wifiStatus.state === 'pending' || d.wifiStatus.state === 'sent');
+}
+
+/** El equipo informa el resultado ("ok" / "failed"). Devuelve true si cambió algo. */
+function applyWifiResult(d, result) {
+  if ((result !== 'ok' && result !== 'failed') || !wifiInProgress(d)) return false;
+  d.wifiStatus = { ...d.wifiStatus, state: result, at: new Date().toISOString() };
+  d.pendingWifi = null;
+  return true;
 }
 
 function parseState(value) {
@@ -253,9 +278,33 @@ app.post('/api/devices/:id/status', requireDevice, (req, res) => {
   d.lastSeen = new Date().toISOString();
   if (Number.isFinite(body.rssi)) d.rssi = body.rssi;
   if (typeof body.fw === 'string') d.fw = body.fw.slice(0, 20);
-  if (isNew) persist();
 
-  res.json({ desired: d.desiredState, pollSeconds: POLL_SECONDS, serverTime: new Date().toISOString() });
+  let changed = isNew;
+
+  // Red a la que está conectado (llega en hexadecimal para evitar problemas con comillas y acentos).
+  if (typeof body.ssidHex === 'string' && /^([0-9a-f]{2}){0,32}$/i.test(body.ssidHex)) {
+    const ssid = Buffer.from(body.ssidHex, 'hex').toString('utf8');
+    if (ssid !== d.ssid) {
+      d.ssid = ssid;
+      changed = true;
+    }
+  }
+  if (applyWifiResult(d, body.wifiResult)) changed = true;
+
+  const reply = { desired: d.desiredState, pollSeconds: POLL_SECONDS, serverTime: new Date().toISOString() };
+
+  // Si hay una red nueva pendiente, se le entrega al equipo (en hexadecimal).
+  if (d.pendingWifi) {
+    reply.wifiSsidHex = Buffer.from(d.pendingWifi.ssid, 'utf8').toString('hex');
+    reply.wifiPassHex = Buffer.from(d.pendingWifi.password, 'utf8').toString('hex');
+    if (d.wifiStatus && d.wifiStatus.state === 'pending') {
+      d.wifiStatus = { ...d.wifiStatus, state: 'sent', at: new Date().toISOString() };
+      changed = true;
+    }
+  }
+
+  if (changed) persist();
+  res.json(reply);
 });
 
 /** POST /api/devices/:id/command — botón manual de la web. Body: { "state": "ON"|"OFF" } */
@@ -283,6 +332,41 @@ app.patch('/api/devices/:id', requireAdmin, (req, res) => {
   const name = String((req.body || {}).name ?? '').trim();
   if (!name || name.length > 60) throw new HttpError(400, 'El nombre debe tener entre 1 y 60 caracteres');
   d.name = name;
+  persist();
+  res.json(toPublic(d));
+});
+
+/**
+ * POST /api/devices/:id/wifi — pide al equipo que cambie de red Wi-Fi.
+ * Body: { "ssid": "MiRed", "password": "clave" }  (password vacío = red abierta)
+ * El equipo prueba la red nueva; si no conecta o no llega al servidor, vuelve a la anterior.
+ */
+app.post('/api/devices/:id/wifi', requireAdmin, (req, res) => {
+  const d = mustGetDevice(req.params.id);
+  const body = req.body || {};
+  const ssid = typeof body.ssid === 'string' ? body.ssid : '';
+  const password = typeof body.password === 'string' ? body.password : '';
+  const ssidBytes = Buffer.byteLength(ssid, 'utf8');
+  const passBytes = Buffer.byteLength(password, 'utf8');
+
+  if (ssidBytes < 1 || ssidBytes > 32) throw new HttpError(400, 'El nombre de la red debe tener entre 1 y 32 caracteres');
+  if (passBytes !== 0 && (passBytes < 8 || passBytes > 63)) {
+    throw new HttpError(400, 'La contraseña debe tener entre 8 y 63 caracteres (déjala vacía solo si la red es abierta)');
+  }
+  if (wifiInProgress(d)) throw new HttpError(409, 'Ya hay un cambio de red en curso. Espera el resultado o cancélalo');
+
+  d.pendingWifi = { ssid, password };
+  d.wifiStatus = { state: 'pending', ssid, at: new Date().toISOString() };
+  persist();
+  res.json(toPublic(d));
+});
+
+/** DELETE /api/devices/:id/wifi — cancela un cambio de red que el equipo aún no terminó. */
+app.delete('/api/devices/:id/wifi', requireAdmin, (req, res) => {
+  const d = mustGetDevice(req.params.id);
+  if (!wifiInProgress(d)) throw new HttpError(409, 'No hay un cambio de red en curso');
+  d.pendingWifi = null;
+  d.wifiStatus = { ...d.wifiStatus, state: 'cancelled', at: new Date().toISOString() };
   persist();
   res.json(toPublic(d));
 });
@@ -377,7 +461,12 @@ async function main() {
   try {
     const saved = await storage.load();
     if (saved && Array.isArray(saved.devices)) {
-      for (const d of saved.devices) devices.set(d.id, { ...newDevice(d.id, 'OFF'), ...d });
+      for (const d of saved.devices) {
+        const dev = { ...newDevice(d.id, 'OFF'), ...d, pendingWifi: null };
+        // La contraseña pendiente no se guarda: si el servidor se reinició a mitad de un cambio, queda cancelado.
+        if (wifiInProgress(dev)) dev.wifiStatus = { ...dev.wifiStatus, state: 'cancelled', at: new Date().toISOString() };
+        devices.set(dev.id, dev);
+      }
     }
     console.log(`[storage] ${storage.mode}: ${devices.size} equipo(s) cargado(s)`);
   } catch (err) {
