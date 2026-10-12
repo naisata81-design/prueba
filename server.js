@@ -125,7 +125,12 @@ async function myBranch(req, id) { const b = await col('branches').findOne({ _id
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map((s) => s.trim()),
+const ORIGINS = ALLOWED_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean);
+const LOCAL_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+// Permite: '*', los orígenes de ALLOWED_ORIGIN, localhost (pruebas) y "null" (index.html abierto con doble clic).
+// La API usa Bearer token (no cookies), así que esto no expone sesiones.
+const corsOrigin = (origin, cb) => cb(null, !origin || ORIGINS.includes('*') || ORIGINS.includes(origin) || LOCAL_RE.test(origin) || origin === 'null');
+app.use(cors({ origin: corsOrigin,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 const small = express.json({ limit: '20kb' });
 const big = express.json({ limit: '400kb' }); // solo para el logo en PATCH /api/me
