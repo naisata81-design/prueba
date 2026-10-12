@@ -12,11 +12,12 @@
 
 En Atlas: *Network Access* debe permitir la salida de Render (`0.0.0.0/0` si no tienes IP fija).
 
-## Cómo se vinculan los equipos (sin tocar el ESP)
-El `DEVICE_ID` que grabas en cada ESP debe **empezar con el ID de la cuenta del cliente**:
-`CLI-0001AB-oficina1`. Así cada cliente solo ve y da de alta sus propios equipos.
-Un equipo que llama antes del alta queda "detectado" y sin dueño: el servidor no le manda órdenes.
-Equipos viejos sin prefijo: `POST /api/admin/devices/:id/assign` con `{ "accountId": "CLI-..." }`.
+## Cómo se vinculan los equipos (por número de serie)
+Cada ESP trae grabado su **número de serie** (`DEVICE_ID`, único por equipo, ej. `DAL-V5-000123`) y su modelo (`DAL-RELAY-V5`).
+Al encenderse y conectarse, el equipo se registra solo en el servidor, **sin dueño** (no recibe órdenes).
+El cliente entra a *Dispositivos → Alta*, escribe el número de serie y el equipo queda vinculado a su cuenta.
+Si ya está vinculado a otra cuenta, el servidor no deja agregarlo. Para liberarlo: el dueño lo quita de su cuenta, o tú desde el admin.
+Un número de serie que nunca se ha conectado no se puede vincular. Equipos viejos: `POST /api/admin/devices/:id/assign` con `{ "accountId": "CLI-..." }`.
 
 ## ESP-01
 Sin cambios: `POST /api/devices/:id/status` con `x-device-key`, misma respuesta (`desired`, `pollSeconds`, Wi-Fi remoto).

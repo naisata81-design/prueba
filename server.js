@@ -198,12 +198,11 @@ app.patch('/api/me', requireUser, wrap(async (req, res) => {
 app.get('/api/state', requireUser, wrap(async (req, res) => {
   const id = req.acc._id;
   const [branches, routines] = await Promise.all([col('branches').find({ accountId: id }).toArray(), col('routines').find({ accountId: id }).toArray()]);
-  const prefix = `${id.toUpperCase()}-`;
   res.json({
     serverTime: new Date().toISOString(), timezone: APP_TIMEZONE, pollSeconds: POLL_SECONDS, account: pubAccount(req.acc),
     branches: branches.map(pubBranch), routines: routines.map(pubRoutine),
     devices: [...devices.values()].filter((d) => d.accountId === id).sort((a, b) => a.id.localeCompare(b.id)).map(toPublic),
-    detected: [...devices.values()].filter((d) => !d.accountId && d.id.toUpperCase().startsWith(prefix)).map((d) => ({ id: d.id, online: isOnline(d), fw: d.fw })),
+    detected: [],
   });
 }));
 
@@ -257,15 +256,18 @@ async function placement(req, b) { // valida sucursal y zona de la cuenta
   return { branchId: br._id, zoneId: b.zoneId || null };
 }
 app.post('/api/devices', requireUser, wrap(async (req, res) => {
-  const b = req.body || {}, id = String(b.id || '').trim();
-  if (!ID_RE.test(id)) throw new HttpError(400, 'ID inválido (letras, números, - o _; máx. 40)');
-  if (!id.toUpperCase().startsWith(`${req.acc._id.toUpperCase()}-`)) throw new HttpError(400, `El ID del dispositivo debe empezar con el ID de tu cuenta: ${req.acc._id}-`);
-  if ([...devices.values()].filter((d) => d.accountId === req.acc._id).length >= LIM.devices) throw new HttpError(400, `Máximo ${LIM.devices} dispositivos`);
-  let d = devices.get(id);
-  if (d && d.accountId) throw new HttpError(409, 'Ese ID ya está dado de alta');
-  if (!d) { d = newDevice(id, 'OFF'); devices.set(id, d); }
-  Object.assign(d, { accountId: req.acc._id, name: b.name ? text(b.name, 60, 'El nombre') : id, model: String(b.model || '').trim().slice(0, 60), ...(await placement(req, b)) });
-  if (d.lastSeen) d.desiredState = d.reportedState; // si el equipo ya había llamado, se respeta su estado real
+  // Vincular un equipo a la cuenta con su NÚMERO DE SERIE (el DEVICE_ID grabado en el ESP, independiente de la cuenta).
+  const b = req.body || {}, typed = String(b.id || '').trim(), key = `link|${req.acc._id}`;
+  if (tooMany(key)) throw new HttpError(429, 'Demasiados intentos. Espera unos minutos.');
+  if (!ID_RE.test(typed)) throw new HttpError(400, 'Número de serie inválido (letras, números, - o _; máx. 40)');
+  const d = [...devices.values()].find((x) => x.id.toUpperCase() === typed.toUpperCase());
+  if (!d) { failed(key); throw new HttpError(404, 'No se encontró ese número de serie. Revisa que esté bien escrito y que el equipo esté encendido y conectado a internet.'); }
+  if (d.accountId === req.acc._id) throw new HttpError(409, 'Este equipo ya está en tu cuenta');
+  if (d.accountId) { failed(key); throw new HttpError(409, 'Este equipo ya está vinculado a otra cuenta'); }
+  if ([...devices.values()].filter((x) => x.accountId === req.acc._id).length >= LIM.devices) throw new HttpError(400, `Máximo ${LIM.devices} dispositivos`);
+  const place = await placement(req, b);
+  Object.assign(d, { accountId: req.acc._id, name: b.name ? text(b.name, 60, 'El nombre') : d.id, model: String(b.model || d.hwModel || '').trim().slice(0, 60), ...place });
+  if (d.lastSeen) d.desiredState = d.reportedState; // se respeta el estado real del equipo
   persist(d);
   res.status(201).json(toPublic(d));
 }));
