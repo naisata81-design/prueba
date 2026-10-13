@@ -237,6 +237,14 @@ app.post('/api/branches/:id/zones', requireUser, wrap(async (req, res) => {
   await col('branches').updateOne({ _id: br._id }, { $set: { zones } });
   res.status(201).json(pubBranch({ ...br, zones }));
 }));
+app.patch('/api/branches/:id/zones/:zid', requireUser, wrap(async (req, res) => {
+  const br = await myBranch(req, req.params.id);
+  if (!br.zones.some((z) => z.id === req.params.zid)) throw new HttpError(404, 'Zona no encontrada');
+  const name = text((req.body || {}).name, 60, 'El nombre de la zona');
+  const zones = br.zones.map((z) => (z.id === req.params.zid ? { ...z, name } : z));
+  await col('branches').updateOne({ _id: br._id }, { $set: { zones } });
+  res.json(pubBranch({ ...br, zones }));
+}));
 app.delete('/api/branches/:id/zones/:zid', requireUser, wrap(async (req, res) => {
   const br = await myBranch(req, req.params.id);
   if (!br.zones.some((z) => z.id === req.params.zid)) throw new HttpError(404, 'Zona no encontrada');
