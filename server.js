@@ -79,7 +79,7 @@ const dirty = new Set();
 let flushTimer = null;
 
 const newDevice = (id, state) => ({ id, accountId: null, name: id, model: '', branchId: null, zoneId: null, desiredState: state, reportedState: state,
-  lastSeen: null, rssi: null, fw: null, hwModel: null, serial: null, cmdAt: null, ssid: null, wifiStatus: null, pendingWifi: null });
+  lastSeen: null, firstSeen: new Date().toISOString(), rssi: null, fw: null, hwModel: null, serial: null, cmdAt: null, ssid: null, wifiStatus: null, pendingWifi: null });
 const isOnline = (d) => Boolean(d.lastSeen) && Date.now() - Date.parse(d.lastSeen) < Math.max(30, POLL_SECONDS * 3) * 1000;
 const toPublic = (d) => ({ id: d.id, name: d.name, model: d.model, branchId: d.branchId, zoneId: d.zoneId, desiredState: d.desiredState, reportedState: d.reportedState,
   online: isOnline(d), lastSeen: d.lastSeen, rssi: d.rssi, fw: d.fw, hwModel: d.hwModel, serial: d.serial, ssid: d.ssid, wifiStatus: d.wifiStatus });
@@ -380,9 +380,74 @@ app.get('/api/admin/accounts', requireAdmin, wrap(async (req, res) => {
   const [accs, brs, rts] = await Promise.all([col('accounts').find({}).toArray(), col('branches').find({}).toArray(), col('routines').find({}).toArray()]);
   const count = (list, id) => list.filter((x) => x.accountId === id).length;
   res.json({ accounts: accs.map((a) => ({ ...pubAccount(a), createdAt: a.createdAt, branches: count(brs, a._id), routines: count(rts, a._id),
-    devices: [...devices.values()].filter((d) => d.accountId === a._id).length })) });
+    devices: [...devices.values()].filter((d) => d.accountId === a._id).length,
+    online: [...devices.values()].filter((d) => d.accountId === a._id && isOnline(d)).length })) });
 }));
-app.get('/api/admin/devices', requireAdmin, (req, res) => res.json({ devices: [...devices.values()].map((d) => ({ ...toPublic(d), accountId: d.accountId })) }));
+const adminDevice = (d, names) => ({ ...toPublic(d), accountId: d.accountId, company: d.accountId ? (names.get(d.accountId) || d.accountId) : null, adminNote: d.adminNote || '', firstSeen: d.firstSeen || null });
+app.get('/api/admin/devices', requireAdmin, wrap(async (req, res) => {
+  const names = new Map((await col('accounts').find({}).toArray()).map((a) => [a._id, a.company]));
+  res.json({ devices: [...devices.values()].map((d) => adminDevice(d, names)) });
+}));
+app.patch('/api/admin/devices/:id', requireAdmin, wrap(async (req, res) => { // nota interna del equipo (solo la ve el admin)
+  const d = devices.get(req.params.id);
+  if (!d) throw new HttpError(404, 'Equipo no encontrado');
+  if ((req.body || {}).adminNote !== undefined) d.adminNote = String(req.body.adminNote).trim().slice(0, 300);
+  persist(d);
+  res.json({ ok: true });
+}));
+app.post('/api/admin/devices/:id/release', requireAdmin, wrap(async (req, res) => {
+  const d = devices.get(req.params.id);
+  if (!d) throw new HttpError(404, 'Equipo no encontrado');
+  release(d); res.json({ ok: true });
+}));
+app.delete('/api/admin/devices/:id', requireAdmin, wrap(async (req, res) => { // borra el registro (si el equipo sigue encendido, reaparecerá solo)
+  const d = devices.get(req.params.id);
+  if (!d) throw new HttpError(404, 'Equipo no encontrado');
+  devices.delete(d.id); dirty.delete(d.id);
+  await col('devices').deleteOne({ _id: d.id });
+  res.json({ ok: true });
+}));
+
+/* Catálogo de modelos (control de lo que vamos fabricando) */
+const MODEL_STATUS = ['desarrollo', 'activo', 'descontinuado'];
+function cleanModel(b, partial) {
+  const o = {};
+  if (!partial || b.name !== undefined) o.name = text(b.name, 40, 'El código del modelo');
+  if (!partial || b.title !== undefined) o.title = String(b.title ?? '').trim().slice(0, 80);
+  if (!partial || b.status !== undefined) { const st = b.status || 'activo'; if (!MODEL_STATUS.includes(st)) throw new HttpError(400, `Estado: ${MODEL_STATUS.join(', ')}`); o.status = st; }
+  if (!partial || b.firmware !== undefined) o.firmware = String(b.firmware ?? '').trim().slice(0, 20);
+  if (!partial || b.releasedAt !== undefined) { const r = String(b.releasedAt ?? '').trim(); if (r && !/^\d{4}-\d{2}-\d{2}$/.test(r)) throw new HttpError(400, 'Fecha de lanzamiento: AAAA-MM-DD'); o.releasedAt = r; }
+  if (!partial || b.notes !== undefined) o.notes = String(b.notes ?? '').trim().slice(0, 500);
+  return o;
+}
+const pubModel = ({ _id, ...m }) => ({ id: _id, ...m });
+app.get('/api/admin/models', requireAdmin, wrap(async (req, res) => {
+  const list = await col('models').find({}).toArray(), all = [...devices.values()];
+  const stat = (name) => { const L = all.filter((d) => (d.hwModel || '').toLowerCase() === name.toLowerCase()); return { devices: L.length, online: L.filter(isOnline).length, assigned: L.filter((d) => d.accountId).length }; };
+  const known = new Set(list.map((m) => m.name.toLowerCase()));
+  const seen = new Map();
+  for (const d of all) { const k = d.hwModel || ''; if (k && !known.has(k.toLowerCase())) seen.set(k, (seen.get(k) || 0) + 1); }
+  res.json({ models: list.map((m) => ({ ...pubModel(m), ...stat(m.name) })), unregistered: [...seen].map(([name, devices]) => ({ name, devices })) });
+}));
+app.post('/api/admin/models', requireAdmin, wrap(async (req, res) => {
+  const o = cleanModel(req.body || {}, false);
+  if (await col('models').findOne({ name: { $regex: `^${o.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })) throw new HttpError(409, 'Ya existe un modelo con ese código');
+  const doc = { _id: rid(), ...o, createdAt: new Date().toISOString() };
+  await col('models').insertOne(doc);
+  res.status(201).json(pubModel(doc));
+}));
+app.patch('/api/admin/models/:id', requireAdmin, wrap(async (req, res) => {
+  const cur = await col('models').findOne({ _id: req.params.id });
+  if (!cur) throw new HttpError(404, 'Modelo no encontrado');
+  const o = cleanModel(req.body || {}, true);
+  await col('models').updateOne({ _id: cur._id }, { $set: o });
+  res.json(pubModel({ ...cur, ...o }));
+}));
+app.delete('/api/admin/models/:id', requireAdmin, wrap(async (req, res) => {
+  const r = await col('models').deleteOne({ _id: req.params.id });
+  if (!r.deletedCount) throw new HttpError(404, 'Modelo no encontrado');
+  res.json({ ok: true });
+}));
 app.post('/api/admin/devices/:id/assign', requireAdmin, wrap(async (req, res) => { // para equipos viejos sin prefijo de cuenta
   const d = devices.get(req.params.id), accountId = String((req.body || {}).accountId || '');
   if (!d) throw new HttpError(404, 'Equipo no encontrado');

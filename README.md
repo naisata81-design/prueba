@@ -29,7 +29,7 @@ Sin cambios: `POST /api/devices/:id/status` con `x-device-key`, misma respuesta 
 - `POST /api/branches` · `PATCH|DELETE /api/branches/:id` · `POST /api/branches/:id/zones` · `DELETE /api/branches/:id/zones/:zid`
 - `POST /api/devices` `{id,name,model,branchId,zoneId}` · `PATCH|DELETE /api/devices/:id` · `POST /api/devices/:id/command` · `POST|DELETE /api/devices/:id/wifi`
 - `POST /api/routines` · `PUT|PATCH|DELETE /api/routines/:id` — `{branchId, zoneId|null, onTime, offTime, days[0-6], enabled}`
-- Admin (`ADMIN_TOKEN`): `GET /api/admin/accounts`, `DELETE /api/admin/accounts/:id`, `GET /api/admin/devices`, `POST /api/admin/devices/:id/assign`
+- Admin (`ADMIN_TOKEN`): `GET /api/admin/accounts`, `DELETE /api/admin/accounts/:id`, `GET /api/admin/devices`, `POST /api/admin/devices/:id/assign`, `PATCH|DELETE /api/admin/devices/:id` (nota interna / borrar registro), `POST /api/admin/devices/:id/release`, `GET|POST /api/admin/models`, `PATCH|DELETE /api/admin/models/:id` (catálogo de modelos)
 
 ## Cambios respecto a v1
 - Se quitó `storage.js` (Upstash/archivo): ahora todo vive en MongoDB.
